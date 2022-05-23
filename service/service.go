@@ -189,8 +189,12 @@ func Service() {
 			select {
 			case event, ok := <-watcher.Events:
 				if ok {
-					log.Println(event)
-					OnModify(event) // REVIEW: might want catch errors?
+					// log.Println(event)
+					if event.Op == fsnotify.Remove {
+						watcher.Remove(event.Name)
+						watcher.Add(event.Name) // NOTE: editors like Vim does RENAME+CHMOD+REMOVE on write
+					}
+					OnModify(event)
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
