@@ -4,18 +4,13 @@ import (
 	"fmt"
 	rice "github.com/GeertJohan/go.rice"
 	"github.com/fsnotify/fsnotify"
-	"github.com/pflow-dev/go-metamodel/metamodel"
-	"github.com/pflow-dev/go-metamodel/metamodel/js"
-	"github.com/pflow-dev/go-metamodel/metamodel/lua"
+	"github.com/gorilla/mux"
+	"github.com/pflow-dev/go-metamodel/metamodel/image"
 	"github.com/pflow-dev/pflow/codec"
+	"github.com/pflow-dev/pflow/model/source"
 	"github.com/r3labs/sse"
-	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
 )
 
 var (
@@ -34,145 +29,70 @@ func init() {
 	EventServer.CreateStream(StreamId)
 }
 
+func ImageHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	vars := mux.Vars(r)
+
+	cid := vars["cid"]
+
+	m := source.GetModel(cid)
+	if m == nil {
+		i := image.NewSvg(w, 512, 256)
+		i.Text(50, 50, fmt.Sprintf(`no matching model for cid: %s`, cid))
+		i.End()
+		return
+	}
+	width, height := source.GetSize(m)
+	i := image.NewSvg(w, width, height)
+	state := m.InitialVector()
+
+	q := r.URL.Query()
+	rawState := q.Get("state") // fallback to query param
+	if rawState != "" {
+		err := codec.Unmarshal([]byte(rawState), &state)
+		if err != nil {
+			i.Text(50, 50, fmt.Sprintf(`error parsing state-vector: %v`, state))
+			i.End()
+			return
+		}
+		if len(state) != 0 && len(state) != len(m.Places) {
+			i.Text(50, 50, fmt.Sprintf(`invalid state-vector: %v expected len: %v`, state, len(m.Places)))
+			i.End()
+			return
+		}
+	}
+	if len(state) == 0 {
+		state = m.InitialVector()
+	}
+	i.Render(m, state)
+}
+
 func Webserver() {
 	go Service()
 
 	// Create a new Mux and set the handler
-	mux := http.NewServeMux()
-
-	mux.Handle("/", http.FileServer(Box.HTTPBox()))
-	mux.HandleFunc("/models.json", func(w http.ResponseWriter, r *http.Request) {
+	router := mux.NewRouter()
+	router.HandleFunc("/models.json", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("GET models.json")
+		// TODO: add search params
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(ToJson())
+		w.Write(source.ToJson())
 	})
-	mux.HandleFunc("/sse", EventServer.HTTPHandler)
+	router.HandleFunc("/{cid}/image.svg", ImageHandler)
+	router.HandleFunc("/sse", EventServer.HTTPHandler)
+	router.PathPrefix("/").Handler(http.FileServer(Box.HTTPBox()))
 
-	err := http.ListenAndServe(":8080", mux)
+	err := http.ListenAndServe(":8080", router)
 	if err != nil {
 		panic(err)
 	}
-}
-
-type SourceFile struct {
-	*metamodel.Model `json:"model"`
-}
-
-var Models = make(map[string]*SourceFile, 0)
-
-func WriteModels(format string) {
-	switch format {
-	case "json":
-		fmt.Printf("%s", ToJson())
-	default:
-		panic("unsupported output format " + format)
-	}
-}
-
-func ToJson() []byte {
-	m := make(map[string]*metamodel.Model, 0)
-	for k, v := range Models {
-		m[k] = v.Model
-	}
-	return codec.Marshal(m)
 }
 
 func OnModify(event fsnotify.Event) {
-	m := LoadModel(event.Name)
-	if LastCid != m.Cid {
+	m := source.LoadModel(event.Name)
+	if m != nil && LastCid != m.Cid {
 		LastCid = m.Cid
 		EventServer.Publish(StreamId, &sse.Event{Data: []byte(`{ "cid": "` + m.Cid + `" }`)})
-	}
-}
-
-func LoadModels(path string) error {
-	stat, err := os.Stat(ModelPath)
-	if err != nil {
-		return err
-	}
-	if stat.IsDir() {
-		files, err := ioutil.ReadDir(path)
-		if err != nil {
-			panic(err)
-		}
-		for _, f := range files {
-			if f.IsDir() {
-				LoadModels(filepath.Join(path, f.Name()))
-			} else {
-				LoadModel(filepath.Join(path, f.Name()))
-			}
-		}
-	} else {
-		LoadModel(path)
-	}
-	return nil
-}
-
-func readFile(path string) (source []byte, err error) {
-	source, err = os.ReadFile(path)
-	for {
-		if err != nil {
-			time.Sleep(time.Second) // sleep
-			source, err = os.ReadFile(path)
-			if err != nil {
-				log.Println(err)
-			}
-		} else {
-			return source, err
-		}
-	}
-}
-
-func ReloadLua(path string) (src *SourceFile) {
-	source, err := readFile(path)
-	var m *metamodel.Model
-	m, err = lua.LoadModel(string(source))
-	if err != nil {
-		panic(err)
-	}
-	name := filepath.Base(path)
-	src = &SourceFile{
-		Model: m,
-	}
-	src.Path = name
-	src.Cid = codec.ToOid(source).String()
-	Models[name] = src
-	log.Println("loaded:", name, src.Cid)
-	return src
-}
-func ReloadJs(path string) (src *SourceFile) {
-	source, err := readFile(path)
-	var m *metamodel.Model
-	m, err = js.LoadModel(string(source))
-	if err != nil {
-		panic(err)
-	}
-	name := filepath.Base(path)
-	src = &SourceFile{
-		Model: m,
-	}
-	src.Path = name
-	src.Cid = codec.ToOid(source).String()
-	Models[name] = src
-	log.Println("loaded:", name, src.Cid)
-	return src
-}
-
-func getFileExt(path string) string {
-	ext := strings.Split(path, ".")
-	return ext[len(ext)-1]
-}
-
-func LoadModel(path string) (src *SourceFile) {
-
-	fileExt := getFileExt(path)
-	switch fileExt {
-	case "lua":
-		return ReloadLua(path)
-	case "js":
-		return ReloadJs(path)
-	default:
-		panic("unrecognized file ext for models " + fileExt)
 	}
 }
 
@@ -189,7 +109,6 @@ func Service() {
 			select {
 			case event, ok := <-watcher.Events:
 				if ok {
-					// log.Println(event)
 					if event.Op == fsnotify.Remove {
 						watcher.Remove(event.Name)
 						watcher.Add(event.Name) // NOTE: editors like Vim does RENAME+CHMOD+REMOVE on write
@@ -205,8 +124,8 @@ func Service() {
 		}
 	}()
 
-	LoadModel(ModelPath)
-	err = watcher.Add(ModelPath)
+	source.LoadModels(ModelPath)
+	err = watcher.Add(ModelPath) // REVIEW: will this work watching a directory?
 	if err != nil {
 		log.Fatal(err)
 	}

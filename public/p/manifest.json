@@ -1,6 +1,6 @@
 {
-  "short_name": "Petriflow",
-  "name": "Petri-Net simulator",
+  "short_name": "pflow",
+  "name": "Petri-Net modeling and simulation",
   "icons": [
     {
       "src": "favicon.ico",

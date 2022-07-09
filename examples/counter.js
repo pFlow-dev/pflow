@@ -31,4 +31,4 @@ function CounterModel (fn, cell, role) {
     p3.guard(1, inc1)
 }
 
-domodel("counter", CounterModel)
+domodel("counter-js", CounterModel)
